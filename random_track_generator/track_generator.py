@@ -218,7 +218,8 @@ def generate_track(preset: Preset | str | None = None,
                    min_bound: float | None = None, 
                    max_bound: float | None = None, 
                    mode: Mode | str = Mode.RANDOM,
-                   seed: int | None = None) -> Track:
+                   seed: int | None = None,
+                   max_attempts: int = 100) -> Track:
     """
     Generates a track from the vertices of a Voronoi diagram.
     A preset can be provided for quick generation, with optional keyword
@@ -234,6 +235,7 @@ def generate_track(preset: Preset | str | None = None,
         max_bound: Maximum boundary value for the track.
         mode: Mode of generation.
         seed: Random seed for reproducibility.
+        max_attempts: Maximum number of generation attempts before raising an error.
 
     Returns:
         Generated track object.
@@ -269,12 +271,27 @@ def generate_track(preset: Preset | str | None = None,
             "Provide a preset or set them explicitly."
         )
 
-    while True:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1.")
+
+    last_error = None
+    for attempt in range(max_attempts):
         try:
-            track = _create_track(**params, seed=seed)
-            return track
-        except:
-            continue
+            # Preserve the requested seed on the first attempt. Derive later
+            # seeds from both values so batch seeds do not overlap on retries.
+            attempt_seed = None
+            if seed is not None:
+                attempt_seed = seed if attempt == 0 else int(
+                    np.random.SeedSequence([seed, attempt]).generate_state(1)[0]
+                )
+            return _create_track(**params, seed=attempt_seed)
+        except Exception as error:
+            last_error = error
+
+    raise RuntimeError(
+        f"Unable to generate a valid track after {max_attempts} attempts. "
+        "Try different generation parameters."
+    ) from last_error
 
 def load_track(name: str) -> Track:
     """
