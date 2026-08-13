@@ -62,7 +62,8 @@ def _create_track(n_points: int,
                   min_bound: float, 
                   max_bound: float, 
                   mode: Mode | str = Mode.EXPAND,
-                  seed: int | None = None) -> Track:
+                  seed: int | None = None,
+                  track_width: float = TRACK_WIDTH) -> Track:
     """
     Creates a track from the vertices of a Voronoi diagram.
     1.  Create bounded Voronoi diagram.
@@ -163,8 +164,8 @@ def _create_track(n_points: int,
         
         # Create track boundaries
         track = Polygon(zip(x, y))
-        track_left = track.buffer(TRACK_WIDTH / 2)
-        track_right = track.buffer(-TRACK_WIDTH / 2)
+        track_left = track.buffer(track_width / 2)
+        track_right = track.buffer(-track_width / 2)
         
         # Check if track does not cross itself
         if track.is_valid and track_left.is_valid and track_right.is_valid:
@@ -172,8 +173,8 @@ def _create_track(n_points: int,
                 break
 
     # Calculate cone spacing        
-    cone_spacing_left = np.linspace(0, track_left.length, np.ceil(track_left.length / TRACK_WIDTH).astype(int) + 1)[:-1]
-    cone_spacing_right= np.linspace(0, track_right.length, np.ceil(track_right.length / TRACK_WIDTH).astype(int) + 1)[:-1]
+    cone_spacing_left = np.linspace(0, track_left.length, np.ceil(track_left.length / track_width).astype(int) + 1)[:-1]
+    cone_spacing_right= np.linspace(0, track_right.length, np.ceil(track_right.length / track_width).astype(int) + 1)[:-1]
         
     # Determine coordinates of cones
     cones_left = np.asarray([np.asarray(track_left.exterior.interpolate(sp).xy).flatten() for sp in cone_spacing_left])
@@ -219,6 +220,7 @@ def generate_track(preset: Preset | str | None = None,
                    max_bound: float | None = None, 
                    mode: Mode | str = Mode.RANDOM,
                    seed: int | None = None,
+                   track_width: float = TRACK_WIDTH,
                    max_attempts: int = 100) -> Track:
     """
     Generates a track from the vertices of a Voronoi diagram.
@@ -235,6 +237,7 @@ def generate_track(preset: Preset | str | None = None,
         max_bound: Maximum boundary value for the track.
         mode: Mode of generation.
         seed: Random seed for reproducibility.
+        track_width: Fixed track width in metres.
         max_attempts: Maximum number of generation attempts before raising an error.
 
     Returns:
@@ -274,6 +277,9 @@ def generate_track(preset: Preset | str | None = None,
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1.")
 
+    if track_width <= 0:
+        raise ValueError("track_width must be positive.")
+
     last_error = None
     for attempt in range(max_attempts):
         try:
@@ -284,7 +290,7 @@ def generate_track(preset: Preset | str | None = None,
                 attempt_seed = seed if attempt == 0 else int(
                     np.random.SeedSequence([seed, attempt]).generate_state(1)[0]
                 )
-            return _create_track(**params, seed=attempt_seed)
+            return _create_track(**params, seed=attempt_seed, track_width=track_width)
         except Exception as error:
             last_error = error
 
