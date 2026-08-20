@@ -16,7 +16,7 @@ PRESET_PARAMS: dict[Preset, dict] = {
 TRACK_WIDTH = 3.                   # [m]
 CONE_SPACING = 5.                  # [m]
 LENGTH_START_AREA = 6.             # [m]
-CURVATURE_THRESHOLD = 1. / 3.75    # [m^-1]
+MIN_OUTER_TURNING_DIAMETER = 9.    # [m]
 STRAIGHT_THRESHOLD = 1. / 100.     # [m^-1]
 
 def _cone_distances(boundary_length: float,
@@ -104,7 +104,8 @@ def _create_track(n_points: int,
                   cone_spacing_stddev: float = 0.0,
                   cone_spacing_min: float | None = None,
                   cone_spacing_max: float = CONE_SPACING,
-                  cone_spacing_offset: float = 0.0) -> Track:
+                  cone_spacing_offset: float = 0.0,
+                  min_outer_turning_diameter: float = MIN_OUTER_TURNING_DIAMETER) -> Track:
     """
     Creates a track from the vertices of a Voronoi diagram.
     1.  Create bounded Voronoi diagram.
@@ -133,6 +134,12 @@ def _create_track(n_points: int,
                 cone_spacing_mean / 2,
             ),
         )
+
+    # Formula Student D 1.1.10 specifies a 9 m minimum turning diameter on
+    # the outside of a corner. Convert that outer-boundary radius to the
+    # corresponding centreline curvature limit for this track width.
+    min_centerline_radius = (min_outer_turning_diameter - track_width) / 2
+    curvature_threshold = 1 / min_centerline_radius
 
     # Create bounded Voronoi diagram
     input_points = rng.uniform(min_bound, max_bound, (n_points, 2))
@@ -194,7 +201,7 @@ def _create_track(n_points: int,
             
             # Check if curvature exceeds threshold
             peaks, _ = signal.find_peaks(abs_curvature)
-            exceeded_peaks = abs_curvature[peaks] > CURVATURE_THRESHOLD
+            exceeded_peaks = abs_curvature[peaks] > curvature_threshold
             max_peak_index = abs_curvature[peaks].argmax()
             is_curvature_exceeded = exceeded_peaks[max_peak_index]
             
@@ -281,6 +288,7 @@ def generate_track(preset: Preset | str | None = None,
                    cone_spacing_min: float | None = None,
                    cone_spacing_max: float = CONE_SPACING,
                    cone_spacing_offset: float = 0.0,
+                   min_outer_turning_diameter: float = MIN_OUTER_TURNING_DIAMETER,
                    max_attempts: int = 100) -> Track:
     """
     Generates a track from the vertices of a Voronoi diagram.
@@ -306,6 +314,8 @@ def generate_track(preset: Preset | str | None = None,
         cone_spacing_max: Maximum allowed distance between adjacent cones in metres.
         cone_spacing_offset: Right-cone-row shift, as a fraction of its average
             cone spacing. Must be between 0 and 0.5.
+        min_outer_turning_diameter: Minimum permitted outer turning diameter in
+            metres. Defaults to the Formula Student requirement of 9 m.
         max_attempts: Maximum number of generation attempts before raising an error.
 
     Returns:
@@ -345,8 +355,14 @@ def generate_track(preset: Preset | str | None = None,
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1.")
 
-    if track_width <= 0:
-        raise ValueError("track_width must be positive.")
+    if min_outer_turning_diameter <= 0:
+        raise ValueError("min_outer_turning_diameter must be positive.")
+
+    if not 0 < track_width < min_outer_turning_diameter:
+        raise ValueError(
+            f"track_width must be greater than 0 and less than "
+            f"min_outer_turning_diameter ({min_outer_turning_diameter} m)."
+        )
 
     if cone_spacing_mean <= 0:
         raise ValueError("cone_spacing_mean must be positive.")
@@ -389,6 +405,7 @@ def generate_track(preset: Preset | str | None = None,
                 cone_spacing_min=cone_spacing_min,
                 cone_spacing_max=cone_spacing_max,
                 cone_spacing_offset=cone_spacing_offset,
+                min_outer_turning_diameter=min_outer_turning_diameter,
             )
         except Exception as error:
             last_error = error
