@@ -19,9 +19,33 @@ LENGTH_START_AREA = 6.             # [m]
 CURVATURE_THRESHOLD = 1. / 3.75    # [m^-1]
 STRAIGHT_THRESHOLD = 1. / 100.     # [m^-1]
 
-def _cone_distances(boundary_length: float, maximum: float) -> np.ndarray:
-    """Return evenly spaced cone positions around a closed boundary."""
-    n_cones = int(np.ceil(boundary_length / maximum))
+def _cone_distances(boundary_length: float,
+                    mean: float,
+                    stddev: float,
+                    minimum: float,
+                    maximum: float,
+                    rng: np.random.Generator) -> np.ndarray:
+    """Return cone positions around a closed boundary.
+
+    Spacings are sampled independently from a truncated normal distribution.
+    The final gap, which closes the boundary back to the first cone, is also
+    at most the requested maximum.
+    """
+    min_cones = int(np.ceil(boundary_length / maximum))
+    max_cones = int(np.floor(boundary_length / minimum))
+    if min_cones > max_cones:
+        raise ValueError("Cone-spacing bounds cannot cover this boundary length.")
+
+    n_cones = int(np.clip(round(boundary_length / mean), min_cones, max_cones))
+    for _ in range(100):
+        spacings = rng.normal(mean, stddev, n_cones)
+        spacings = np.maximum(spacings, minimum)
+        spacings += (boundary_length - spacings.sum()) / n_cones
+        if np.all((spacings >= minimum) & (spacings <= maximum)):
+            return np.concatenate(([0.0], np.cumsum(spacings[:-1])))
+
+    # A uniform distribution is a valid deterministic fallback if repeated
+    # random draws cannot satisfy both spacing bounds.
     return np.linspace(0, boundary_length, n_cones, endpoint=False)
 
 def _bounded_voronoi(input_points: np.ndarray, bounding_box: np.ndarray) -> spatial.Voronoi:
@@ -68,7 +92,11 @@ def _create_track(n_points: int,
                   max_bound: float, 
                   mode: Mode | str = Mode.EXPAND,
                   seed: int | None = None,
-                  track_width: float = TRACK_WIDTH) -> Track:
+                  track_width: float = TRACK_WIDTH,
+                  cone_spacing_mean: float = CONE_SPACING,
+                  cone_spacing_stddev: float = 0.0,
+                  cone_spacing_min: float | None = None,
+                  cone_spacing_max: float = CONE_SPACING) -> Track:
     """
     Creates a track from the vertices of a Voronoi diagram.
     1.  Create bounded Voronoi diagram.
@@ -89,6 +117,14 @@ def _create_track(n_points: int,
         Generated track object.
     """
     rng = np.random.default_rng(seed)
+    if cone_spacing_min is None:
+        cone_spacing_min = max(
+            0.1,
+            min(
+                cone_spacing_mean - 3 * cone_spacing_stddev,
+                cone_spacing_mean / 2,
+            ),
+        )
 
     # Create bounded Voronoi diagram
     input_points = rng.uniform(min_bound, max_bound, (n_points, 2))
@@ -177,9 +213,15 @@ def _create_track(n_points: int,
             if track.geom_type == track_left.geom_type == track_right.geom_type == 'Polygon':
                 break
 
-    # Calculate cone spacing.
-    cone_spacing_left = _cone_distances(track_left.length, CONE_SPACING)
-    cone_spacing_right = _cone_distances(track_right.length, CONE_SPACING)
+    # Calculate variable cone spacing for each boundary.
+    cone_spacing_left = _cone_distances(
+        track_left.length, cone_spacing_mean, cone_spacing_stddev,
+        cone_spacing_min, cone_spacing_max, rng
+    )
+    cone_spacing_right = _cone_distances(
+        track_right.length, cone_spacing_mean, cone_spacing_stddev,
+        cone_spacing_min, cone_spacing_max, rng
+    )
         
     # Determine coordinates of cones
     cones_left = np.asarray([np.asarray(track_left.exterior.interpolate(sp).xy).flatten() for sp in cone_spacing_left])
@@ -226,6 +268,10 @@ def generate_track(preset: Preset | str | None = None,
                    mode: Mode | str = Mode.RANDOM,
                    seed: int | None = None,
                    track_width: float = TRACK_WIDTH,
+                   cone_spacing_mean: float = CONE_SPACING,
+                   cone_spacing_stddev: float = 0.0,
+                   cone_spacing_min: float | None = None,
+                   cone_spacing_max: float = CONE_SPACING,
                    max_attempts: int = 100) -> Track:
     """
     Generates a track from the vertices of a Voronoi diagram.
@@ -243,6 +289,12 @@ def generate_track(preset: Preset | str | None = None,
         mode: Mode of generation.
         seed: Random seed for reproducibility.
         track_width: Fixed track width in metres.
+        cone_spacing_mean: Mean spacing between cones in metres.
+        cone_spacing_stddev: Standard deviation of cone spacing in metres.
+        cone_spacing_min: Minimum allowed distance between adjacent cones in
+            metres. Defaults to the lower of mean minus three standard
+            deviations and half the mean, leaving room to close the boundary.
+        cone_spacing_max: Maximum allowed distance between adjacent cones in metres.
         max_attempts: Maximum number of generation attempts before raising an error.
 
     Returns:
@@ -285,6 +337,26 @@ def generate_track(preset: Preset | str | None = None,
     if track_width <= 0:
         raise ValueError("track_width must be positive.")
 
+    if cone_spacing_mean <= 0:
+        raise ValueError("cone_spacing_mean must be positive.")
+    if cone_spacing_stddev < 0:
+        raise ValueError("cone_spacing_stddev must not be negative.")
+    if cone_spacing_min is not None and cone_spacing_min <= 0:
+        raise ValueError("cone_spacing_min must be positive.")
+    if cone_spacing_max <= 0:
+        raise ValueError("cone_spacing_max must be positive.")
+
+    if cone_spacing_min is None:
+        cone_spacing_min = max(
+            0.1,
+            min(
+                cone_spacing_mean - 3 * cone_spacing_stddev,
+                cone_spacing_mean / 2,
+            ),
+        )
+    if cone_spacing_min > cone_spacing_max:
+        raise ValueError("cone_spacing_min must not exceed cone_spacing_max.")
+
     last_error = None
     for attempt in range(max_attempts):
         try:
@@ -295,7 +367,15 @@ def generate_track(preset: Preset | str | None = None,
                 attempt_seed = seed if attempt == 0 else int(
                     np.random.SeedSequence([seed, attempt]).generate_state(1)[0]
                 )
-            return _create_track(**params, seed=attempt_seed, track_width=track_width)
+            return _create_track(
+                **params,
+                seed=attempt_seed,
+                track_width=track_width,
+                cone_spacing_mean=cone_spacing_mean,
+                cone_spacing_stddev=cone_spacing_stddev,
+                cone_spacing_min=cone_spacing_min,
+                cone_spacing_max=cone_spacing_max,
+            )
         except Exception as error:
             last_error = error
 
