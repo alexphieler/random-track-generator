@@ -24,6 +24,7 @@ def _cone_distances(boundary_length: float,
                     stddev: float,
                     minimum: float,
                     maximum: float,
+                    offset: float,
                     rng: np.random.Generator) -> np.ndarray:
     """Return cone positions around a closed boundary.
 
@@ -37,16 +38,22 @@ def _cone_distances(boundary_length: float,
         raise ValueError("Cone-spacing bounds cannot cover this boundary length.")
 
     n_cones = int(np.clip(round(boundary_length / mean), min_cones, max_cones))
+
+    def _apply_offset(positions: np.ndarray) -> np.ndarray:
+        """Rotate the closed cone row by a fraction of its average spacing."""
+        distance = offset * boundary_length / n_cones
+        return np.sort((positions + distance) % boundary_length)
+
     for _ in range(100):
         spacings = rng.normal(mean, stddev, n_cones)
         spacings = np.maximum(spacings, minimum)
         spacings += (boundary_length - spacings.sum()) / n_cones
         if np.all((spacings >= minimum) & (spacings <= maximum)):
-            return np.concatenate(([0.0], np.cumsum(spacings[:-1])))
+            return _apply_offset(np.concatenate(([0.0], np.cumsum(spacings[:-1]))))
 
     # A uniform distribution is a valid deterministic fallback if repeated
     # random draws cannot satisfy both spacing bounds.
-    return np.linspace(0, boundary_length, n_cones, endpoint=False)
+    return _apply_offset(np.linspace(0, boundary_length, n_cones, endpoint=False))
 
 def _bounded_voronoi(input_points: np.ndarray, bounding_box: np.ndarray) -> spatial.Voronoi:
     """
@@ -96,7 +103,8 @@ def _create_track(n_points: int,
                   cone_spacing_mean: float = CONE_SPACING,
                   cone_spacing_stddev: float = 0.0,
                   cone_spacing_min: float | None = None,
-                  cone_spacing_max: float = CONE_SPACING) -> Track:
+                  cone_spacing_max: float = CONE_SPACING,
+                  cone_spacing_offset: float = 0.0) -> Track:
     """
     Creates a track from the vertices of a Voronoi diagram.
     1.  Create bounded Voronoi diagram.
@@ -216,11 +224,11 @@ def _create_track(n_points: int,
     # Calculate variable cone spacing for each boundary.
     cone_spacing_left = _cone_distances(
         track_left.length, cone_spacing_mean, cone_spacing_stddev,
-        cone_spacing_min, cone_spacing_max, rng
+        cone_spacing_min, cone_spacing_max, 0.0, rng
     )
     cone_spacing_right = _cone_distances(
         track_right.length, cone_spacing_mean, cone_spacing_stddev,
-        cone_spacing_min, cone_spacing_max, rng
+        cone_spacing_min, cone_spacing_max, cone_spacing_offset, rng
     )
         
     # Determine coordinates of cones
@@ -272,6 +280,7 @@ def generate_track(preset: Preset | str | None = None,
                    cone_spacing_stddev: float = 0.0,
                    cone_spacing_min: float | None = None,
                    cone_spacing_max: float = CONE_SPACING,
+                   cone_spacing_offset: float = 0.0,
                    max_attempts: int = 100) -> Track:
     """
     Generates a track from the vertices of a Voronoi diagram.
@@ -295,6 +304,8 @@ def generate_track(preset: Preset | str | None = None,
             metres. Defaults to the lower of mean minus three standard
             deviations and half the mean, leaving room to close the boundary.
         cone_spacing_max: Maximum allowed distance between adjacent cones in metres.
+        cone_spacing_offset: Right-cone-row shift, as a fraction of its average
+            cone spacing. Must be between 0 and 0.5.
         max_attempts: Maximum number of generation attempts before raising an error.
 
     Returns:
@@ -345,6 +356,8 @@ def generate_track(preset: Preset | str | None = None,
         raise ValueError("cone_spacing_min must be positive.")
     if cone_spacing_max <= 0:
         raise ValueError("cone_spacing_max must be positive.")
+    if not 0 <= cone_spacing_offset <= 0.5:
+        raise ValueError("cone_spacing_offset must be between 0 and 0.5.")
 
     if cone_spacing_min is None:
         cone_spacing_min = max(
@@ -375,6 +388,7 @@ def generate_track(preset: Preset | str | None = None,
                 cone_spacing_stddev=cone_spacing_stddev,
                 cone_spacing_min=cone_spacing_min,
                 cone_spacing_max=cone_spacing_max,
+                cone_spacing_offset=cone_spacing_offset,
             )
         except Exception as error:
             last_error = error
