@@ -19,6 +19,11 @@ LENGTH_START_AREA = 6.             # [m]
 CURVATURE_THRESHOLD = 1. / 3.75    # [m^-1]
 STRAIGHT_THRESHOLD = 1. / 100.     # [m^-1]
 
+def _cone_distances(boundary_length: float, maximum: float) -> np.ndarray:
+    """Return evenly spaced cone positions around a closed boundary."""
+    n_cones = int(np.ceil(boundary_length / maximum))
+    return np.linspace(0, boundary_length, n_cones, endpoint=False)
+
 def _bounded_voronoi(input_points: np.ndarray, bounding_box: np.ndarray) -> spatial.Voronoi:
     """
     Creates a Voronoi diagram bounded by the bounding box.
@@ -172,9 +177,9 @@ def _create_track(n_points: int,
             if track.geom_type == track_left.geom_type == track_right.geom_type == 'Polygon':
                 break
 
-    # Calculate cone spacing        
-    cone_spacing_left = np.linspace(0, track_left.length, np.ceil(track_left.length / track_width).astype(int) + 1)[:-1]
-    cone_spacing_right= np.linspace(0, track_right.length, np.ceil(track_right.length / track_width).astype(int) + 1)[:-1]
+    # Calculate cone spacing.
+    cone_spacing_left = _cone_distances(track_left.length, CONE_SPACING)
+    cone_spacing_right = _cone_distances(track_right.length, CONE_SPACING)
         
     # Determine coordinates of cones
     cones_left = np.asarray([np.asarray(track_left.exterior.interpolate(sp).xy).flatten() for sp in cone_spacing_left])
