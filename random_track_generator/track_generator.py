@@ -18,6 +18,7 @@ CONE_SPACING = 5.                  # [m]
 LENGTH_START_AREA = 6.             # [m]
 MIN_OUTER_TURNING_DIAMETER = 9.    # [m]
 STRAIGHT_THRESHOLD = 1. / 100.     # [m^-1]
+CONE_CURVATURE_SMOOTHING_WINDOW = 9
 
 def _cone_distances(boundary_length: float,
                     mean: float,
@@ -25,6 +26,8 @@ def _cone_distances(boundary_length: float,
                     minimum: float,
                     maximum: float,
                     offset: float,
+                    curvature_factor: float,
+                    curvature_at,
                     rng: np.random.Generator) -> np.ndarray:
     """Return cone positions around a closed boundary.
 
@@ -44,16 +47,78 @@ def _cone_distances(boundary_length: float,
         distance = offset * boundary_length / n_cones
         return np.sort((positions + distance) % boundary_length)
 
+    def _fit_bounds(spacings: np.ndarray) -> np.ndarray:
+        """Adjust spacings to the perimeter while preserving their variation."""
+        spacings = np.clip(spacings, minimum, maximum)
+        for _ in range(n_cones):
+            remaining = boundary_length - spacings.sum()
+            if np.isclose(remaining, 0):
+                break
+            adjustable = spacings < maximum if remaining > 0 else spacings > minimum
+            spacings[adjustable] += remaining / adjustable.sum()
+            spacings = np.clip(spacings, minimum, maximum)
+        return spacings
+
     for _ in range(100):
         spacings = rng.normal(mean, stddev, n_cones)
         spacings = np.maximum(spacings, minimum)
         spacings += (boundary_length - spacings.sum()) / n_cones
         if np.all((spacings >= minimum) & (spacings <= maximum)):
+            if curvature_factor:
+                base_spacings = spacings.copy()
+                phase_offset = offset * boundary_length / n_cones
+                # Re-evaluate the curvature after moving cones. This prevents
+                # the compressed region from trailing behind the corner.
+                for _ in range(3):
+                    midpoints = (
+                        np.cumsum(spacings) - spacings / 2 + phase_offset
+                    ) % boundary_length
+                    local_curvature = curvature_at(midpoints)
+                    smoothing_window = min(
+                        CONE_CURVATURE_SMOOTHING_WINDOW,
+                        len(local_curvature) - (len(local_curvature) + 1) % 2,
+                    )
+                    if smoothing_window >= 3:
+                        local_curvature = signal.savgol_filter(
+                            local_curvature,
+                            window_length=smoothing_window,
+                            polyorder=2,
+                            mode="wrap",
+                        )
+                    local_curvature = np.maximum(local_curvature, 0)
+                    curvature_scale = np.percentile(local_curvature, 95)
+                    if curvature_scale == 0:
+                        break
+                    normalized_curvature = np.clip(local_curvature / curvature_scale, 0, 1)
+                    # At factor 1, gaps in the tightest parts shrink to 35%
+                    # of their ordinary size before respecting min/max bounds.
+                    spacings = _fit_bounds(
+                        base_spacings * (1 - 0.65 * curvature_factor * normalized_curvature)
+                    )
             return _apply_offset(np.concatenate(([0.0], np.cumsum(spacings[:-1]))))
 
     # A uniform distribution is a valid deterministic fallback if repeated
     # random draws cannot satisfy both spacing bounds.
     return _apply_offset(np.linspace(0, boundary_length, n_cones, endpoint=False))
+
+
+def _boundary_curvature(boundary, distances: np.ndarray, sample_distance: float) -> np.ndarray:
+    """Approximate curvature at distances along a closed Shapely boundary."""
+    boundary_length = boundary.length
+    curvatures = []
+    for distance in distances:
+        before = boundary.interpolate((distance - sample_distance) % boundary_length)
+        middle = boundary.interpolate(distance % boundary_length)
+        after = boundary.interpolate((distance + sample_distance) % boundary_length)
+        a = middle.distance(after)
+        b = before.distance(after)
+        c = before.distance(middle)
+        cross_product = abs(
+            (middle.x - before.x) * (after.y - before.y)
+            - (middle.y - before.y) * (after.x - before.x)
+        )
+        curvatures.append(2 * cross_product / (a * b * c) if a * b * c else 0.0)
+    return np.asarray(curvatures)
 
 def _bounded_voronoi(input_points: np.ndarray, bounding_box: np.ndarray) -> spatial.Voronoi:
     """
@@ -105,6 +170,7 @@ def _create_track(n_points: int,
                   cone_spacing_min: float | None = None,
                   cone_spacing_max: float = CONE_SPACING,
                   cone_spacing_offset: float = 0.0,
+                  inner_cone_curvature_factor: float = 0.0,
                   min_outer_turning_diameter: float = MIN_OUTER_TURNING_DIAMETER) -> Track:
     """
     Creates a track from the vertices of a Voronoi diagram.
@@ -231,11 +297,16 @@ def _create_track(n_points: int,
     # Calculate variable cone spacing for each boundary.
     cone_spacing_left = _cone_distances(
         track_left.length, cone_spacing_mean, cone_spacing_stddev,
-        cone_spacing_min, cone_spacing_max, 0.0, rng
+        cone_spacing_min, cone_spacing_max, 0.0, 0.0, None, rng
     )
     cone_spacing_right = _cone_distances(
         track_right.length, cone_spacing_mean, cone_spacing_stddev,
-        cone_spacing_min, cone_spacing_max, cone_spacing_offset, rng
+        cone_spacing_min, cone_spacing_max, cone_spacing_offset,
+        inner_cone_curvature_factor,
+        lambda distances: _boundary_curvature(
+            track_right.exterior, distances, cone_spacing_mean / 4
+        ),
+        rng,
     )
         
     # Determine coordinates of cones
@@ -288,6 +359,7 @@ def generate_track(preset: Preset | str | None = None,
                    cone_spacing_min: float | None = None,
                    cone_spacing_max: float = CONE_SPACING,
                    cone_spacing_offset: float = 0.0,
+                   inner_cone_curvature_factor: float = 0.0,
                    min_outer_turning_diameter: float = MIN_OUTER_TURNING_DIAMETER,
                    max_attempts: int = 100) -> Track:
     """
@@ -314,6 +386,8 @@ def generate_track(preset: Preset | str | None = None,
         cone_spacing_max: Maximum allowed distance between adjacent cones in metres.
         cone_spacing_offset: Right-cone-row shift, as a fraction of its average
             cone spacing. Must be between 0 and 0.5.
+        inner_cone_curvature_factor: Tightens inner-boundary cone spacing in
+            corners. 0 ignores curvature; 1 applies the strongest effect.
         min_outer_turning_diameter: Minimum permitted outer turning diameter in
             metres. Defaults to the Formula Student requirement of 9 m.
         max_attempts: Maximum number of generation attempts before raising an error.
@@ -374,6 +448,8 @@ def generate_track(preset: Preset | str | None = None,
         raise ValueError("cone_spacing_max must be positive.")
     if not 0 <= cone_spacing_offset <= 0.5:
         raise ValueError("cone_spacing_offset must be between 0 and 0.5.")
+    if not 0 <= inner_cone_curvature_factor <= 1:
+        raise ValueError("inner_cone_curvature_factor must be between 0 and 1.")
 
     if cone_spacing_min is None:
         cone_spacing_min = max(
@@ -405,6 +481,7 @@ def generate_track(preset: Preset | str | None = None,
                 cone_spacing_min=cone_spacing_min,
                 cone_spacing_max=cone_spacing_max,
                 cone_spacing_offset=cone_spacing_offset,
+                inner_cone_curvature_factor=inner_cone_curvature_factor,
                 min_outer_turning_diameter=min_outer_turning_diameter,
             )
         except Exception as error:
