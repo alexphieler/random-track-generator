@@ -61,8 +61,16 @@ def arc_length(x: np.ndarray, y: np.ndarray, R: np.ndarray) -> float:
     R = R[:-1]
     
     distance = np.sqrt((x1 - x0)**2 + (y1 - y0)**2)
-    theta = 2 * np.arcsin(0.5 * distance / R)
-    arc_length = R * theta
+    valid_radius = np.isfinite(R) & (R > 0)
+    ratio = np.zeros_like(distance)
+    np.divide(0.5 * distance, R, out=ratio, where=valid_radius)
+    theta = 2 * np.arcsin(np.clip(ratio, 0, 1))
+
+    # A straight segment has an infinite radius, where the chord is the arc
+    # length. Clipping also handles small numerical inconsistencies between
+    # the spline's discrete chord and its local curvature estimate.
+    arc_length = distance.copy()
+    arc_length[valid_radius] = R[valid_radius] * theta[valid_radius]
     return arc_length
 
 def transformation_matrix(displacement: tuple, angle: float):

@@ -19,6 +19,7 @@ LENGTH_START_AREA = 6.             # [m]
 MIN_OUTER_TURNING_DIAMETER = 9.    # [m]
 STRAIGHT_THRESHOLD = 1. / 100.     # [m^-1]
 CONE_CURVATURE_SMOOTHING_WINDOW = 9
+HAIRPIN_GAP_SHAPE = 3
 
 def _cone_distances(boundary_length: float,
                     mean: float,
@@ -158,6 +159,207 @@ def _bounded_voronoi(input_points: np.ndarray, bounding_box: np.ndarray) -> spat
     vor.filtered_regions = np.array(vor.regions, dtype=object)[vor.point_region[:vor.npoints//5]]
     return vor
 
+
+def _create_hairpin_track(*,
+                          min_bound: float,
+                          max_bound: float,
+                          track_width: float,
+                          cone_spacing_mean: float,
+                          cone_spacing_stddev: float,
+                          cone_spacing_min: float,
+                          cone_spacing_max: float,
+                          cone_spacing_offset: float,
+                          inner_cone_curvature_factor: float,
+                          min_outer_turning_diameter: float,
+                          hairpin_min_inner_cone_gap: float,
+                          rng: np.random.Generator) -> Track:
+    """Create a varied long out-and-back circuit with two U-turns."""
+    min_centerline_radius = (min_outer_turning_diameter - track_width) / 2
+    # The two straight legs are separated by twice the U-turn radius.  After
+    # subtracting one track width, this is the clear gap between their
+    # inner-facing cone rows.
+    minimum_turn_radius = max(
+        min_centerline_radius,
+        (hairpin_min_inner_cone_gap + track_width) / 2,
+        track_width / 2 + 1e-6,
+    )
+    straight_length = rng.uniform(30.0, 200.0)
+    maximum_turn_radius = max(
+        minimum_turn_radius + 1.0,
+        min(30.0, 0.35 * straight_length),
+    )
+    # Prefer close parallel legs, while retaining occasional wide hairpins.
+    # Beta(1, 3) has most of its mass near zero, i.e. the minimum gap.
+    turn_radius = minimum_turn_radius + rng.beta(1, HAIRPIN_GAP_SHAPE) * (
+        maximum_turn_radius - minimum_turn_radius
+    )
+    bow = rng.uniform(0.0, 0.15 * straight_length)
+
+    x = np.linspace(-straight_length / 2, straight_length / 2, 200)
+    straight_curve = bow * (np.sin(np.pi * (x + straight_length / 2) / straight_length) ** 2 - 1)
+    outbound = np.column_stack((x, straight_curve))
+
+    far_turn = np.column_stack((
+        straight_length / 2 + turn_radius * np.cos(np.linspace(np.pi / 2, -np.pi / 2, 80)),
+        -bow - turn_radius + turn_radius * np.sin(np.linspace(np.pi / 2, -np.pi / 2, 80)),
+    ))[1:]
+    return_leg = np.column_stack((x[::-1], straight_curve[::-1] - 2 * turn_radius))[1:]
+    near_turn = np.column_stack((
+        -straight_length / 2 - turn_radius * np.cos(np.linspace(-np.pi / 2, np.pi / 2, 80)),
+        -bow - turn_radius + turn_radius * np.sin(np.linspace(-np.pi / 2, np.pi / 2, 80)),
+    ))[1:]
+    centreline = np.vstack((outbound, far_turn, return_leg, near_turn))
+
+    track = Polygon(centreline)
+    track_left = track.buffer(track_width / 2)
+    track_right = track.buffer(-track_width / 2)
+    if track_left.geom_type != "Polygon" or track_right.geom_type != "Polygon":
+        raise ValueError("Unable to create a valid hairpin track.")
+
+    cone_spacing_left = _cone_distances(
+        track_left.length, cone_spacing_mean, cone_spacing_stddev,
+        cone_spacing_min, cone_spacing_max, 0.0, 0.0, None, rng,
+    )
+    cone_spacing_right = _cone_distances(
+        track_right.length, cone_spacing_mean, cone_spacing_stddev,
+        cone_spacing_min, cone_spacing_max, cone_spacing_offset,
+        inner_cone_curvature_factor,
+        lambda distances: _boundary_curvature(
+            track_right.exterior, distances, cone_spacing_mean / 4
+        ),
+        rng,
+    )
+
+    cones_left = np.asarray([
+        np.asarray(track_left.exterior.interpolate(spacing).xy).flatten()
+        for spacing in cone_spacing_left
+    ])
+    cones_right = np.asarray([
+        np.asarray(track_right.exterior.interpolate(spacing).xy).flatten()
+        for spacing in cone_spacing_right
+    ])
+    return Track(cones_left, cones_right)
+
+
+def _create_slalom_track(*,
+                         track_width: float,
+                         cone_spacing_mean: float,
+                         cone_spacing_stddev: float,
+                         cone_spacing_min: float,
+                         cone_spacing_max: float,
+                         cone_spacing_offset: float,
+                         inner_cone_curvature_factor: float,
+                         rng: np.random.Generator) -> Track:
+    """Create an out-and-back layout with smooth, alternating bends."""
+    straight_length = rng.uniform(60.0, 200.0)
+    max_waves = max(2, int(straight_length / 30.0))
+    waves = rng.integers(2, max_waves + 1)
+    amplitude = rng.uniform(2.5, 5.0)
+    leg_gap = track_width + rng.uniform(3.0, 18.0)
+
+    x = np.linspace(0.0, straight_length, 300)
+    progress = x / straight_length
+    envelope = np.sin(np.pi * progress) ** 2
+    outbound_y = amplitude * np.sin(2 * np.pi * waves * progress) * envelope
+    return_y = (
+        outbound_y
+        - leg_gap
+        + 0.2 * amplitude * np.sin(np.pi * progress) ** 2
+    )
+    radius = leg_gap / 2
+    far_turn = np.column_stack((
+        straight_length + radius * np.cos(np.linspace(np.pi / 2, -np.pi / 2, 80)),
+        -radius + radius * np.sin(np.linspace(np.pi / 2, -np.pi / 2, 80)),
+    ))[1:]
+    near_turn = np.column_stack((
+        -radius * np.cos(np.linspace(-np.pi / 2, np.pi / 2, 80)),
+        -radius + radius * np.sin(np.linspace(-np.pi / 2, np.pi / 2, 80)),
+    ))[1:]
+    centreline = np.vstack((
+        np.column_stack((x, outbound_y)),
+        far_turn,
+        np.column_stack((x[::-1], return_y[::-1]))[1:],
+        near_turn,
+    ))
+    return _create_parametric_track(
+        centreline, track_width, cone_spacing_mean, cone_spacing_stddev,
+        cone_spacing_min, cone_spacing_max, cone_spacing_offset,
+        inner_cone_curvature_factor, rng,
+    )
+
+
+def _create_technical_track(*,
+                            track_width: float,
+                            cone_spacing_mean: float,
+                            cone_spacing_stddev: float,
+                            cone_spacing_min: float,
+                            cone_spacing_max: float,
+                            cone_spacing_offset: float,
+                            inner_cone_curvature_factor: float,
+                            rng: np.random.Generator) -> Track:
+    """Create a compact but smooth multi-corner circuit."""
+    base_radius = rng.uniform(42.0, 70.0)
+    bends = rng.integers(3, 6)
+    primary_amplitude = rng.uniform(3.0, 6.0)
+    secondary_amplitude = rng.uniform(1.0, 3.0)
+    primary_phase, secondary_phase = rng.uniform(0.0, 2 * np.pi, 2)
+    angle = np.linspace(0.0, 2 * np.pi, 600, endpoint=False)
+    radius = (
+        base_radius
+        + primary_amplitude * np.sin(bends * angle + primary_phase)
+        + secondary_amplitude * np.sin(2 * bends * angle + secondary_phase)
+    )
+    centreline = np.column_stack((radius * np.cos(angle), 0.8 * radius * np.sin(angle)))
+    return _create_parametric_track(
+        centreline, track_width, cone_spacing_mean, cone_spacing_stddev,
+        cone_spacing_min, cone_spacing_max, cone_spacing_offset,
+        inner_cone_curvature_factor, rng,
+    )
+
+
+def _create_parametric_track(centreline: np.ndarray,
+                             track_width: float,
+                             cone_spacing_mean: float,
+                             cone_spacing_stddev: float,
+                             cone_spacing_min: float,
+                             cone_spacing_max: float,
+                             cone_spacing_offset: float,
+                             inner_cone_curvature_factor: float,
+                             rng: np.random.Generator) -> Track:
+    """Place cones on the two boundaries formed by a closed centreline."""
+    track = Polygon(centreline)
+    track_left = track.buffer(track_width / 2)
+    track_right = track.buffer(-track_width / 2)
+    if (
+        not track.is_valid
+        or track_left.geom_type != "Polygon"
+        or track_right.geom_type != "Polygon"
+    ):
+        raise ValueError("Unable to create a valid parametric track.")
+
+    cone_spacing_left = _cone_distances(
+        track_left.length, cone_spacing_mean, cone_spacing_stddev,
+        cone_spacing_min, cone_spacing_max, 0.0, 0.0, None, rng,
+    )
+    cone_spacing_right = _cone_distances(
+        track_right.length, cone_spacing_mean, cone_spacing_stddev,
+        cone_spacing_min, cone_spacing_max, cone_spacing_offset,
+        inner_cone_curvature_factor,
+        lambda distances: _boundary_curvature(
+            track_right.exterior, distances, cone_spacing_mean / 4
+        ),
+        rng,
+    )
+    cones_left = np.asarray([
+        np.asarray(track_left.exterior.interpolate(spacing).xy).flatten()
+        for spacing in cone_spacing_left
+    ])
+    cones_right = np.asarray([
+        np.asarray(track_right.exterior.interpolate(spacing).xy).flatten()
+        for spacing in cone_spacing_right
+    ])
+    return Track(cones_left, cones_right)
+
 def _create_track(n_points: int, 
                   n_regions: int, 
                   min_bound: float, 
@@ -171,7 +373,8 @@ def _create_track(n_points: int,
                   cone_spacing_max: float = CONE_SPACING,
                   cone_spacing_offset: float = 0.0,
                   inner_cone_curvature_factor: float = 0.0,
-                  min_outer_turning_diameter: float = MIN_OUTER_TURNING_DIAMETER) -> Track:
+                  min_outer_turning_diameter: float = MIN_OUTER_TURNING_DIAMETER,
+                  hairpin_min_inner_cone_gap: float = 3.0) -> Track:
     """
     Creates a track from the vertices of a Voronoi diagram.
     1.  Create bounded Voronoi diagram.
@@ -206,6 +409,44 @@ def _create_track(n_points: int,
     # corresponding centreline curvature limit for this track width.
     min_centerline_radius = (min_outer_turning_diameter - track_width) / 2
     curvature_threshold = 1 / min_centerline_radius
+
+    if mode == Mode.HAIRPIN:
+        return _create_hairpin_track(
+            min_bound=min_bound,
+            max_bound=max_bound,
+            track_width=track_width,
+            cone_spacing_mean=cone_spacing_mean,
+            cone_spacing_stddev=cone_spacing_stddev,
+            cone_spacing_min=cone_spacing_min,
+            cone_spacing_max=cone_spacing_max,
+            cone_spacing_offset=cone_spacing_offset,
+            inner_cone_curvature_factor=inner_cone_curvature_factor,
+            min_outer_turning_diameter=min_outer_turning_diameter,
+            hairpin_min_inner_cone_gap=hairpin_min_inner_cone_gap,
+            rng=rng,
+        )
+    if mode == Mode.SLALOM:
+        return _create_slalom_track(
+            track_width=track_width,
+            cone_spacing_mean=cone_spacing_mean,
+            cone_spacing_stddev=cone_spacing_stddev,
+            cone_spacing_min=cone_spacing_min,
+            cone_spacing_max=cone_spacing_max,
+            cone_spacing_offset=cone_spacing_offset,
+            inner_cone_curvature_factor=inner_cone_curvature_factor,
+            rng=rng,
+        )
+    if mode == Mode.TECHNICAL:
+        return _create_technical_track(
+            track_width=track_width,
+            cone_spacing_mean=cone_spacing_mean,
+            cone_spacing_stddev=cone_spacing_stddev,
+            cone_spacing_min=cone_spacing_min,
+            cone_spacing_max=cone_spacing_max,
+            cone_spacing_offset=cone_spacing_offset,
+            inner_cone_curvature_factor=inner_cone_curvature_factor,
+            rng=rng,
+        )
 
     # Create bounded Voronoi diagram
     input_points = rng.uniform(min_bound, max_bound, (n_points, 2))
@@ -361,6 +602,7 @@ def generate_track(preset: Preset | str | None = None,
                    cone_spacing_offset: float = 0.0,
                    inner_cone_curvature_factor: float = 0.0,
                    min_outer_turning_diameter: float = MIN_OUTER_TURNING_DIAMETER,
+                   hairpin_min_inner_cone_gap: float = 3.0,
                    max_attempts: int = 100) -> Track:
     """
     Generates a track from the vertices of a Voronoi diagram.
@@ -390,6 +632,8 @@ def generate_track(preset: Preset | str | None = None,
             corners. 0 ignores curvature; 1 applies the strongest effect.
         min_outer_turning_diameter: Minimum permitted outer turning diameter in
             metres. Defaults to the Formula Student requirement of 9 m.
+        hairpin_min_inner_cone_gap: Minimum clear distance in metres between
+            the inner-facing cone rows of a hairpin's parallel legs.
         max_attempts: Maximum number of generation attempts before raising an error.
 
     Returns:
@@ -450,6 +694,8 @@ def generate_track(preset: Preset | str | None = None,
         raise ValueError("cone_spacing_offset must be between 0 and 0.5.")
     if not 0 <= inner_cone_curvature_factor <= 1:
         raise ValueError("inner_cone_curvature_factor must be between 0 and 1.")
+    if hairpin_min_inner_cone_gap < 0:
+        raise ValueError("hairpin_min_inner_cone_gap must not be negative.")
 
     if cone_spacing_min is None:
         cone_spacing_min = max(
@@ -483,6 +729,7 @@ def generate_track(preset: Preset | str | None = None,
                 cone_spacing_offset=cone_spacing_offset,
                 inner_cone_curvature_factor=inner_cone_curvature_factor,
                 min_outer_turning_diameter=min_outer_turning_diameter,
+                hairpin_min_inner_cone_gap=hairpin_min_inner_cone_gap,
             )
         except Exception as error:
             last_error = error

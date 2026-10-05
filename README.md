@@ -57,6 +57,9 @@ cones_left, cones_right = track.as_tuple()
 - **`"expand"`** - Selects nearest neighbors for roundish tracks
 - **`"extend"`** - Selects regions along a random line for elongated tracks
 - **`"random"`** - Randomly selects regions for large, irregular tracks
+- **`"hairpin"`** - Creates a long out-and-back layout with tight U-turns
+- **`"slalom"`** - Creates an out-and-back layout with alternating bends
+- **`"technical"`** - Creates a compact circuit with frequent direction changes
 
 
 > **Note:** Not all parameter combinations produce stable results. Experiment with settings if generation fails.
@@ -75,6 +78,7 @@ cones_left, cones_right = track.as_tuple()
 ```python
 track.save("output/", sim_type="fssim")         # YAML for FSSIM
 track.save("output/", sim_type="fsds")          # CSV for FSDS
+track.save("output/", sim_type="pacsim")        # YAML for PACSim
 track.save("output/", sim_type="gpx", 
            lat_offset=51.19, lon_offset=5.32)   # GPX with coordinates
 ```
